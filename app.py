@@ -10,6 +10,8 @@ import streamlit as st
 # BKT 参数预设 (这里填入你之前定好的先验值)
 # 如果你所有节点的参数都一样，就用 default，有特殊节点就加在后面
 # ==========================================
+
+
 BKT_PARAMS = {
     "default": {"L0": 0.15, "T": 0.28, "G": 0.18, "S": 0.12},
     # 例如：如果你知道某个节点基础好，可以单独设置
@@ -180,23 +182,60 @@ if submitted:
 
         st.success(f"提交成功：{len(rows)} 条作答记录。")
         
-        # 汇总表改为显示最终状态
-        st.write("### 📊 各知识节点最终掌握率")
+
+
+        st.success(f"提交成功：{len(rows)} 条作答记录。")
+
+        # ====================================================
+        # 自动化提取：生成给大模型的 Prompt 和 诊断摘要
+        # ====================================================
+        
+        # 1. 页面直接展示“断崖节点”
+        st.write("### 📊 各节点最终掌握率")
         summary_data = [{"节点": k, "最终掌握率": v} for k, v in current_mastery.items()]
         st.table(summary_data)
 
-        st.dataframe(rows, use_container_width=True)
+        # 2. 自动组装错题上下文和轨迹
+        wrong_context = ""
+        for idx, r in enumerate(rows):
+            if r["correct"] == 0:
+                # 找到这道题的掌握率轨迹（这里简化处理，直接展示错误时的状态）
+                wrong_context += f"- 题目 [{r['item_id']}] (所属节点: {r['node_uid']})：学生选了 {r['selected_option']}，对应错误码：{r['misconception_code']}，此时该节点掌握率变为 {r['node_mastery_prob']}。\n"
+
+        # 3. 生成一键复制的超级 Prompt
+        st.write("---")
+#        st.write("### 📋 一键生成诊断报告（复制下方内容去 ima 运行）")
+        
+#        prompt = f"""你是一名国际数学诊断专家。请根据以下学生的作答数据，严格按照四节结构（一句话判断、证据、维修工建议、下一步），写一份专业的诊断报告。
+        prompt=f"""
+【学生代号】{learner_id}
+
+【数据摘要】
+- 未达标节点及最终掌握率：{[{"节点": k, "掌握率": v} for k, v in current_mastery.items() if v < 0.6]}
+
+【错题轨迹与错误码】
+{wrong_context if wrong_context else "所有题目均作答正确，无明显错误轨迹。"}"""
+        
 
 
-        # 使用内置库生成 CSV
+#请输出完整的诊断报告：
+#1. 一句话判断（指出该生最深层的认知缺口）
+#2. 证据（引用错误码和掌握率的断崖变化）
+#3. 维修工建议（分理解、技术、思维给出具体修补方案）
+#4. 下一步（具体练习建议）"""
+  
+        st.code(prompt, language="markdown")
+#      st.caption("👆 点击代码块右上角的复制按钮，粘贴到 ima 中即可生成最终报告。")
+
+        # 4. 原有的 CSV 导出
+        st.write("---")
         output = io.StringIO()
         writer = csv.DictWriter(output, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
         
-        # 提供下载按钮
         st.download_button(
-            "下载本次作答 CSV（用于导入 WPS）",
+            "下载本次作答 CSV（用于备份/入库）",
             output.getvalue().encode("utf-8-sig"),
             file_name=f"answers_{learner_id.strip()}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
             mime="text/csv",
