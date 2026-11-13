@@ -7,6 +7,39 @@ import requests
 import streamlit as st
 
 # ==========================================
+# BKT 参数预设 (这里填入你之前定好的先验值)
+# 如果你所有节点的参数都一样，就用 default，有特殊节点就加在后面
+# ==========================================
+BKT_PARAMS = {
+    "default": {"L0": 0.15, "T": 0.28, "G": 0.18, "S": 0.12},
+    # 例如：如果你知道某个节点基础好，可以单独设置
+    # "D-DER-0001": {"L0": 0.40, "T": 0.25, "G": 0.20, "S": 0.10},
+}
+
+def update_bkt_single_step(current_L, is_correct, node_uid):
+    """
+    单步更新 BKT 掌握概率
+    current_L: 作答本题前的掌握率
+    is_correct: 本题是否答对 (1/0)
+    """
+    params = BKT_PARAMS.get(node_uid, BKT_PARAMS["default"])
+    T, G, S = params["T"], params["G"], params["S"]
+
+    # 1. 贝叶斯后验更新
+    if is_correct == 1:
+        num = current_L * (1 - S)
+        den = current_L * (1 - S) + (1 - current_L) * G
+    else:
+        num = current_L * S
+        den = current_L * S + (1 - current_L) * (1 - G)
+        
+    posterior = num / den if den > 0 else current_L
+
+    # 2. 学习转移
+    new_L = posterior + (1 - posterior) * T
+    return round(new_L, 3)
+
+# ==========================================
 # 1. 安全渲染函数（防止公式中的下划线被 Markdown 吞掉）
 # ==========================================
 def render_text_safely(text):
@@ -105,33 +138,55 @@ if submitted:
     else:
         rows = []
         now = datetime.now().isoformat(timespec="seconds")
-        
+
+        # 1. 初始化每个节点的当前掌握率字典 (默认为 L0)
+        current_mastery = {}
+        for q in QUESTIONS:
+            node = q.get("node_uid", "")
+            if node not in current_mastery:
+                params = BKT_PARAMS.get(node, BKT_PARAMS["default"])
+                current_mastery[node] = params["L0"]
+
+        # 2. 遍历每一道题，边算边记录
         for q in QUESTIONS:
             item_id = q['item_id']
-            # 获取学生答案
+            node_uid = q.get("node_uid", "")
             selected = answers.get(item_id, "")
-            # 自动判分
             correct = 1 if selected == q.get("correct_option") else 0
             
-            # 安全提取错误码（兼容字符串和字典类型）
-            mapping = q.get("distractor_mapping", "")
-            mis_code = ""
-            if isinstance(mapping, dict):
-                mis_code = mapping.get(selected, "")
+            # 提取错误码
+            mis_codes = q.get("mis_codes", {})
+            mis_code = mis_codes.get(selected, "")
+
+            # 👇 核心：取出该节点上一题算出的 L，结合本题对错，算出当前 L
+            L_before = current_mastery[node_uid]
+            L_after = update_bkt_single_step(L_before, correct, node_uid)
             
+            # 更新字典，供这个节点的下一题使用
+            current_mastery[node_uid] = L_after
+
             rows.append({
                 "learner_id": learner_id.strip(),
                 "item_id": item_id,
-                "node_uid": q.get("node_uid", ""),
+                "node_uid": node_uid,
                 "selected_option": selected,
                 "correct": correct,
                 "misconception_code": mis_code,
                 "reasoning_note": answers.get(f"reason_{item_id}", ""),
                 "event_time": now,
+                # 👇 记录的是作答完这道题“当时”的掌握率
+                "node_mastery_prob": L_after
             })
 
         st.success(f"提交成功：{len(rows)} 条作答记录。")
+        
+        # 汇总表改为显示最终状态
+        st.write("### 📊 各知识节点最终掌握率")
+        summary_data = [{"节点": k, "最终掌握率": v} for k, v in current_mastery.items()]
+        st.table(summary_data)
+
         st.dataframe(rows, use_container_width=True)
+
 
         # 使用内置库生成 CSV
         output = io.StringIO()
