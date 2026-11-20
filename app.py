@@ -2,6 +2,14 @@ import csv, io, re, random, requests
 from datetime import datetime
 import streamlit as st
 import graphviz
+from supabase import create_client, Client
+import streamlit as st
+
+@st.cache_resource
+def init_supabase() -> Client:
+    return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
+
+supabase = init_supabase()
 
 # ==========================================
 # 0. 页面配置与全局状态机
@@ -39,8 +47,20 @@ def get_psychological_anchor(trigger_type, target_node="", dimension=""):
     return random.choice(encs)["message"] if encs else "每一次挑战，都是你重塑大脑回路的契机。"
 
 def load_student_history(learner_id):
-    """【扩展接口】学情记忆：未来接入云端数据库后，返回 {node_uid: mastery_prob}"""
-    return {} # 目前返回空，代表全新学生
+    try:
+        resp = supabase.table('student_mastery').select('node_uid', 'mastery_prob').eq('learner_id', learner_id).execute()
+        return {row['node_uid']: row['mastery_prob'] for row in resp.data}
+    except Exception as e:
+        st.warning(f"历史记录读取失败，将按新生处理: {e}")
+        return {}
+
+def save_student_history(learner_id, mastery_dict):
+    try:
+        data = [{"learner_id": learner_id, "node_uid": n, "mastery_prob": p} for n, p in mastery_dict.items()]
+        supabase.table('student_mastery').upsert(data).execute()
+    except Exception as e:
+        st.error(f"学情保存失败: {e}")
+
 
 def adaptive_question_selection(filtered_questions):
     """【扩展接口】自适应题库：目前每个节点盲抽1题，未来可做动态难度"""
@@ -120,33 +140,38 @@ def render_graph(mastery_data):
 # ==========================================
 def gen_verify_q(mis_code):
     conf = st.session_state.strategies.get(mis_code)
-    if not conf: return {"stem": "请重算错题。", "options": ["A. 完成", "B. 未完成"], "correct": "A", "check_point": "验证完。"}
+    # 如果没配置策略，或者模板字段为空，直接返回 None 跳过
+    if not conf or not conf.get("stem_template") or not conf.get("correct_tpl"):
+        return None
     
     vars = {}
     var_range_str = conf.get("var_range", "")
     if var_range_str:
-        # 兼容中文逗号、破折号等常见输入错误
         var_range_str = var_range_str.replace("，", ",").replace("–", "-").replace("—", "-")
         for pair in var_range_str.split(","):
             if ":" in pair:
                 try:
                     v, r = pair.split(":")
-                    v = v.strip()
-                    # 兼容用户输入了 "a: 2 - 5" 这种带空格的
                     mn, mx = map(int, r.strip().split("-"))
-                    vars[v] = random.randint(mn, mx)
+                    vars[v.strip()] = random.randint(mn, mx)
                 except Exception:
-                    continue # 如果格式实在不对，就跳过该变量，不崩溃
-    
+                    continue
+                    
     def r_tpl(t): 
-        try: 
-            # 如果变量没取到，.format 会报错，所以用 try 兜底
-            return t.format(**vars)
-        except: 
-            return t
+        if not t: return None
+        try: return t.format(**vars)
+        except: return t
             
     correct = r_tpl(conf.get("correct_tpl",""))
-    opts = [correct, r_tpl(conf.get("wrong1_tpl","")), r_tpl(conf.get("wrong2_tpl","")), "$0$"]
+    wrong1 = r_tpl(conf.get("wrong1_tpl",""))
+    wrong2 = r_tpl(conf.get("wrong2_tpl",""))
+    wrong3 = r_tpl(conf.get("wrong3_tpl","")) # 🌟 依赖你在 WPS 里补充这第四个选项
+    
+    # 🌟 严格要求：必须 4 个选项齐备才能生成题目
+    opts = [correct, wrong1, wrong2, wrong3]
+    if any(o is None or o == "" for o in opts):
+        return None # 任何一项缺失，直接作废
+        
     random.shuffle(opts)
     
     return {
@@ -224,7 +249,7 @@ def render_placeholder_pages(page_type):
         st.info("📸 **拍照上传，秒级溯源**\n\n上传你做错的题目，AI 将自动提取题干，精准定位它在你认知图谱中的节点，并指出是哪个前置知识断裂导致了这道题的错误。")
         st.write("---")
         st.write("### 🌌 你的当前认知坐标")
-        st.graphviz_chart(render_graph({}), use_container_width=True)
+        st.graphviz_chart(render_graph({}), width='stretch')
         st.caption("👆 未来的错题会精准标记在这个星云图中。")
         
     elif page_type == "companion":
@@ -233,7 +258,7 @@ def render_placeholder_pages(page_type):
         st.write("---")
         st.write("### 🌌 知识星云定位")
         st.markdown("你现在所在的【微积分】模块，只是浩瀚数学宇宙的一角：")
-        st.graphviz_chart(render_graph({}), use_container_width=True)
+        st.graphviz_chart(render_graph({}), width='stretch')
         st.text_area("试想一下，未来你可以这样提问：", "我今天学了链式法则，它到底是用在哪里的？感觉做题总是漏乘。", disabled=True)
         st.caption("👆 AI 回复：链式法则（技术层）是导数星云的核心骨架。你漏乘内层导数，是因为你的『结构识别』概念还没有自动化。我们来看看它在地图上的位置...")
     
@@ -244,31 +269,80 @@ def render_placeholder_pages(page_type):
 # ==========================================
 # 6. 导航与状态机
 # ==========================================
-if st.session_state.stage != "home":
-    if st.sidebar.button("🏠 返回主界面"):
-        st.session_state.stage = "home"; st.rerun()
-
 if st.session_state.stage == "home":
-    st.title("⚡️ 私人数学认知系统")
-    st.write("我是你的专属 AI 认知教练。今天你想做什么？")
+    # 顶部大标题与核心定位
+    st.title("⚡️ 欢迎来到私人数学认知系统")
+    st.markdown("""
+    > *“在这里，数学不再是枯燥的题海，而是你大脑认知升级的通关游戏。”*
+    """)
+    
+    # 🌟 注入灵魂的介绍（使用 st.success 或 st.info 让它高亮显示）
+    st.info("""
+    **🧑‍🏫 你的专属私人数学认知教练已上线**
+    
+    我们不仅用**溯源的方法**帮你快速定位并修补知识缺口，取得考试胜利；
+    我们更是你的**私人认知教练**，会用科学的数据，记录你每一步的认知升级，见证你智慧光芒散发的历史。
+    
+    *每一次红点的消灭，都是大脑神经回路的重塑。*
+    """)
+    
+    st.write("---")
+    st.write("### 今天你想进行哪项训练？")
+    
     c1, c2, c3 = st.columns(3)
     with c1:
-        if st.button("🎯 知识诊断", use_container_width=True): st.session_state.stage = "diagnostic"; st.rerun()
-        st.caption("扫描断点，生成学情图谱。")
+        if st.button("🎯 知识诊断", width='stretch', type="primary"): 
+            st.session_state.stage = "diagnostic"
+            st.rerun()
+        st.caption("扫描知识盲区，生成专属学情星图。")
+        
     with c2:
-        if st.button("📝 错题分析", use_container_width=True): st.session_state.stage = "error_analysis"; st.rerun()
-        st.caption("拍照溯源，定位前置缺口。")
+        if st.button("📝 错题分析", width='stretch'): 
+            st.session_state.stage = "error_analysis"
+            st.rerun()
+        st.caption("拍照上传，秒级溯源前置缺口。")
+        
     with c3:
-        if st.button("🧑‍🏫 伴学对话", use_container_width=True): st.session_state.stage = "companion"; st.rerun()
-        st.caption("对话讲题，暴露真实盲区。")
+        if st.button("🧑‍🏫 伴学对话", width='stretch'): 
+            st.session_state.stage = "companion"
+            st.rerun()
+        st.caption("多维对话，动态记录长期认知。")
 
 elif st.session_state.stage in ["error_analysis", "companion"]:
     render_placeholder_pages(st.session_state.stage)
 
 elif st.session_state.stage == "diagnostic":
     st.title("🎯 知识诊断")
-    st.info(f"👋 **教练寄语**：这是你的第 `{st.session_state.history_count}` 次认知扫描。大胆暴露问题，我帮你兜底。")
+    
+    # 初始化一个占位符，用来显示动态欢迎语
+    welcome_placeholder = st.empty()
+
     lid = st.text_input("你的学生代号", placeholder="例如：STU-01")
+
+    if not lid.strip():
+        welcome_placeholder.info("👋 **教练寄语**：请输入你的代号，调取你的专属认知档案。")
+    else:
+        history_mastery = load_student_history(lid)
+        if history_mastery:
+            welcome_placeholder.success(f"👋 **欢迎回来，{lid}！**\n\n我看到你上次留下了 {len(history_mastery)} 个认知锚点。上一次的红色断点，今天准备点亮它了吗？")
+        else:
+            welcome_placeholder.info(f"👋 **欢迎来到微积分加速站，{lid}！**\n\n这是你的第 1 次认知扫描。大胆暴露问题，我帮你兜底。")
+
+    
+    # 👇 新增：实时查询历史数据并展示初始掌握率
+    if lid.strip():
+        with st.spinner("正在调取认知档案..."):
+            history_mastery = load_student_history(lid)
+            
+        if history_mastery:
+            st.success(f"📊 已识别档案！系统已为你加载 {len(history_mastery)} 个知识点的历史掌握率。")
+            with st.expander("👀 查看你的初始知识底子"):
+                for node, prob in history_mastery.items():
+                    # 用进度条直观显示
+                    st.write(f"知识点：`{node}`")
+                    st.progress(prob, text=f"当前掌握率：{int(prob*100)}%")
+        else:
+            st.info("🆕 未找到历史记录，这将是你的第一次认知基线扫描。")
     
     # 过滤异常数据
     valid_qs = [q for q in Q if q.get("subject") not in ["未关联图谱", ""] and len(q.get("subject")) < 20]
@@ -307,7 +381,7 @@ elif st.session_state.stage == "diagnostic":
                 format_func=lambda x, o=q["options"]: f"{x}. {render_text(o[x])}", 
                 key=f"c_{q['item_id']}"
             )
-        sub = st.form_submit_button("提交全部答案", type="primary", use_container_width=True)
+        sub = st.form_submit_button("提交全部答案", type="primary", width='stretch')
         
     # 🌟 核心修复：提交逻辑
     if sub:
@@ -345,9 +419,11 @@ elif st.session_state.stage == "diagnostic":
                 "invs": invs, "prereq_questions": prereq_questions
             }
             
+            save_student_history(lid, mastery)
             # 清除当前抽题缓存，防止下次进来还是上次的题
             del st.session_state.current_sampled_qs
             del st.session_state.current_mod
+            
             
             # 路由跳转
             if prereq_questions: 
@@ -383,7 +459,7 @@ elif st.session_state.stage == "prereq_check":
 elif st.session_state.stage == "result":
     d = st.session_state.result_data
     st.success("诊断完成！以下为你当前的局部认知图谱：")
-    st.graphviz_chart(render_graph(d["mastery"]), use_container_width=True)
+    st.graphviz_chart(render_graph(d["mastery"]), width='stretch')
     
     prereq_status = d.get("prereq_status", [])
     if prereq_status:
@@ -412,20 +488,41 @@ elif st.session_state.stage == "intervention":
 
 elif st.session_state.stage == "verification":
     st.title("📝 平行验证测试")
-    vqs = []
+    
+    # 过滤掉无法生成模板的无效干预
+    valid_vqs = []
+    for inv in st.session_state.result_data["invs"]:
+        vq = gen_verify_q(inv["mis_code"])
+        if vq is not None:
+            vq["node"] = inv["node"]
+            vq["original_L"] = inv["original_L"]
+            valid_vqs.append(vq)
+            
+    # 如果全都没有模板，直接跳回
+    if not valid_vqs:
+        st.warning("⚠️ 系统检测到该错误模式的变式题库尚未建全，跳过平行验证环节，直接为你生成干预建议。")
+        if st.button("查看诊断报告"):
+            st.session_state.stage = "final"
+            st.rerun()
+        st.stop()
+        
+    st.info("请完成以下专属变式题，证明你已经跨过了刚才的坑。")
+    
     with st.form("verify"):
         ua = {}
-        for i, inv in enumerate(st.session_state.result_data["invs"]):
-            vq = gen_verify_q(inv["mis_code"]); vqs.append(vq)
+        for i, vq in enumerate(valid_vqs):
             st.subheader(f"验证题 {i+1}")
             st.markdown(render_text(vq["stem"]))
             ua[i] = st.radio("选择答案", vq["options"], key=f"vq_{i}")[0]
+            
         if st.form_submit_button("提交验证"):
-            for i, vq in enumerate(vqs):
-                inv = st.session_state.result_data["invs"][i]
-                vq.update({"node": inv["node"], "original_L": inv["original_L"], "new_L": update_bkt(inv["original_L"], 1 if ua[i]==vq["correct"] else 0, inv["node"])})
-            st.session_state.result_data["vqs"] = vqs
-            st.session_state.stage = "final"; st.rerun()
+            for i, vq in enumerate(valid_vqs):
+                # 计算并存入新的掌握率
+                vq["new_L"] = update_bkt(vq["original_L"], 1 if ua[i]==vq["correct"] else 0, vq["node"])
+            
+            st.session_state.result_data["vqs"] = valid_vqs
+            st.session_state.stage = "final"
+            st.rerun()
 
 elif st.session_state.stage == "final":
     d = st.session_state.result_data
@@ -437,7 +534,7 @@ elif st.session_state.stage == "final":
         ctx += f"- {vq['node']}: {vq['original_L']} -> {vq['new_L']}\n"
     
     st.write("### 🗺️ 修补后的图谱")
-    st.graphviz_chart(render_graph(new_m), use_container_width=True)
+    st.graphviz_chart(render_graph(new_m), width='stretch')
     
     st.success(f"🏆 **教练嘉奖**：{get_psychological_anchor('VERIFICATION', 'ALL')}")
     st.write(f"这是你的第 **{st.session_state.history_count}** 次认知跃迁。")
